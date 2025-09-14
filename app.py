@@ -4,17 +4,20 @@ import numpy as np
 import cv2
 from deep_translator import GoogleTranslator
 import easyocr
-import io, os, glob, textwrap, re, json
+import io, os, textwrap, re, concurrent.futures
 from pdf2image import convert_from_bytes
 
 # ==============================
-# Paths
+# Paths & Config
 # ==============================
 FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 TEMP_DIR = "temp_pages"
 BACKUP_DIR = "processed"
 os.makedirs(TEMP_DIR, exist_ok=True)
 os.makedirs(BACKUP_DIR, exist_ok=True)
+
+# Poppler path auto-detect
+POPLER_PATH = "/usr/bin" if os.name != "nt" else r"C:\path\to\poppler\bin"
 
 # ==============================
 # Helpers for cleaning & translation
@@ -63,7 +66,7 @@ def detect_bubbles(image_pil):
     bubbles = []
     for cnt in contours:
         x, y, w, h = cv2.boundingRect(cnt)
-        if w*h > 500 and w*h < image.shape[0]*image.shape[1]*0.5:
+        if w * h > 500 and w * h < image.shape[0] * image.shape[1] * 0.5:
             bubbles.append((x, y, w, h))
     return bubbles
 
@@ -75,16 +78,16 @@ def fit_text_in_box(draw, text, box, max_font=28, min_font=12, padding=5):
     text = str(text)
     for font_size in range(max_font, min_font-1, -1):
         font = ImageFont.truetype(FONT_PATH, font_size)
-        avg_char_width = sum(font.getbbox(c)[2]-font.getbbox(c)[0] for c in text)/max(len(text),1)
-        max_chars_per_line = max(int((w-2*padding)/(avg_char_width+1)),1)
+        avg_char_width = sum(font.getbbox(c)[2]-font.getbbox(c)[0] for c in text)/max(len(text), 1)
+        max_chars_per_line = max(int((w-2*padding)/(avg_char_width+1)), 1)
         lines = textwrap.wrap(text, width=max_chars_per_line)
         line_height = font.getbbox("A")[3] - font.getbbox("A")[1]
         total_height = line_height * len(lines)
         if total_height <= h - 2*padding:
             return font, lines, line_height
     font = ImageFont.truetype(FONT_PATH, min_font)
-    avg_char_width = sum(font.getbbox(c)[2]-font.getbbox(c)[0] for c in text)/max(len(text),1)
-    max_chars_per_line = max(int((w-2*padding)/(avg_char_width+1)),1)
+    avg_char_width = sum(font.getbbox(c)[2]-font.getbbox(c)[0] for c in text)/max(len(text), 1)
+    max_chars_per_line = max(int((w-2*padding)/(avg_char_width+1)), 1)
     lines = textwrap.wrap(text, width=max_chars_per_line)
     line_height = font.getbbox("A")[3] - font.getbbox("A")[1]
     return font, lines, line_height
@@ -107,7 +110,7 @@ def draw_text_in_bubble(draw, text, bubble, padding=5):
 # ==============================
 # Process one page
 # ==============================
-def process_page(fname, fbuf, reader, mode, poppler_path=None):
+def process_page(fname, fbuf, reader, mode):
     image = Image.open(fbuf).convert("RGB")
     if mode.startswith("Fast"):
         max_dim = 1000
@@ -132,18 +135,16 @@ def process_page(fname, fbuf, reader, mode, poppler_path=None):
             mapped.append((closest_bubble, text))
 
     page_log = []
-    for bubble, text in mapped:
-        translated = translate_text_with_log(text, page_log)
-        draw_text_in_bubble(draw, translated, bubble)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        futures = {executor.submit(translate_text_with_log, t, page_log): (bubble, t) for bubble, t in mapped}
+        for future in concurrent.futures.as_completed(futures):
+            bubble, _ = futures[future]
+            translated = future.result()
+            draw_text_in_bubble(draw, translated, bubble)
 
-    # Save processed page to backup folder
-    output_path = os.path.join(BACKUP_DIR, fname)
-    image.save(output_path, "PNG")
-
-    # Save translation log incrementally
-    log_path = os.path.join(BACKUP_DIR, "translation_log.json")
-    with open(log_path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(page_log, ensure_ascii=False) + "\n")
+    # Save backup image
+    backup_path = os.path.join(BACKUP_DIR, fname.replace("/", "_") + ".png")
+    image.save(backup_path)
 
     return fname, image, page_log
 
@@ -165,16 +166,6 @@ if 'processed_pages_dict' not in st.session_state:
 if 'translation_log' not in st.session_state:
     st.session_state['translation_log'] = []
 
-# Load unfinished backup
-if os.path.exists(BACKUP_DIR):
-    for f in sorted(os.listdir(BACKUP_DIR)):
-        if f.endswith(".png") and f not in st.session_state['processed_pages_dict']:
-            st.session_state['processed_pages_dict'][f] = Image.open(os.path.join(BACKUP_DIR, f))
-    log_file = os.path.join(BACKUP_DIR, "translation_log.json")
-    if os.path.exists(log_file):
-        with open(log_file, encoding="utf-8") as f:
-            st.session_state['translation_log'] = [json.loads(line) for line in f]
-
 if uploaded_files:
     reader = easyocr.Reader(['ch_sim','en'], gpu=True)
     all_files = []
@@ -182,7 +173,7 @@ if uploaded_files:
     for file in uploaded_files:
         if file.name.lower().endswith(".pdf"):
             dpi = 100 if mode.startswith("Fast") else 200
-            pdf_pages = convert_from_bytes(file.read(), dpi=dpi, poppler_path="/usr/bin")
+            pdf_pages = convert_from_bytes(file.read(), dpi=dpi, poppler_path=POPLER_PATH)
             for i, page in enumerate(pdf_pages, start=1):
                 fname = f"{file.name}_page{str(i).zfill(4)}.png"
                 buf = io.BytesIO()
@@ -201,26 +192,34 @@ if uploaded_files:
         progress = st.progress(0)
         status_text = st.empty()
 
-        for idx, (fname, fbuf) in enumerate(all_files, start=1):
-            fname, image, page_log = process_page(fname, fbuf, reader, mode)
-            st.session_state['processed_pages_dict'][fname] = image
-            st.session_state['translation_log'].extend(page_log)
-            progress.progress(idx / total_files)
-            status_text.text(f"Processed page {idx}/{total_files}")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+            futures = [
+                executor.submit(process_page, fname, fbuf, reader, mode)
+                for fname, fbuf in all_files
+            ]
+            for idx, future in enumerate(concurrent.futures.as_completed(futures), start=1):
+                try:
+                    fname, image, page_log = future.result()
+                    st.session_state['processed_pages_dict'][fname] = image
+                    st.session_state['translation_log'].extend(page_log)
+                except Exception as e:
+                    st.error(f"Error processing page {fname}: {e}")
+                progress.progress(idx / total_files)
+                status_text.text(f"Processed page {idx}/{total_files}")
 
-# Merge into PDF
-all_pages_sorted = [st.session_state['processed_pages_dict'][fname] for fname in sorted(st.session_state['processed_pages_dict'].keys())]
-if all_pages_sorted:
-    pdf_buf = io.BytesIO()
-    all_pages_sorted[0].save(pdf_buf, format="PDF", save_all=True, append_images=all_pages_sorted[1:])
-    pdf_buf.seek(0)
-    st.success("✅ All pages merged into PDF!")
-    st.download_button(
-        label="📕 Download Full Chapter PDF",
-        data=pdf_buf,
-        file_name="chapter_translated.pdf",
-        mime="application/pdf"
-    )
+    # Merge into PDF
+    all_pages_sorted = [st.session_state['processed_pages_dict'][fname] for fname in sorted(st.session_state['processed_pages_dict'].keys())]
+    if all_pages_sorted:
+        pdf_buf = io.BytesIO()
+        all_pages_sorted[0].save(pdf_buf, format="PDF", save_all=True, append_images=all_pages_sorted[1:])
+        pdf_buf.seek(0)
+        st.success("✅ All pages merged into PDF!")
+        st.download_button(
+            label="📕 Download Full Chapter PDF",
+            data=pdf_buf,
+            file_name="chapter_translated.pdf",
+            mime="application/pdf"
+        )
 
 # Translation log
 with st.expander("📝 Translation Log (Original → Clean → Translated)"):
