@@ -4,16 +4,17 @@ import numpy as np
 import cv2
 from deep_translator import GoogleTranslator
 import easyocr
-import io, os, glob, textwrap, re
+import io, os, glob, textwrap, re, json
 from pdf2image import convert_from_bytes
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ==============================
 # Paths
 # ==============================
 FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 TEMP_DIR = "temp_pages"
+BACKUP_DIR = "processed"
 os.makedirs(TEMP_DIR, exist_ok=True)
+os.makedirs(BACKUP_DIR, exist_ok=True)
 
 # ==============================
 # Helpers for cleaning & translation
@@ -106,7 +107,7 @@ def draw_text_in_bubble(draw, text, bubble, padding=5):
 # ==============================
 # Process one page
 # ==============================
-def process_page(fname, fbuf, reader, mode):
+def process_page(fname, fbuf, reader, mode, poppler_path=None):
     image = Image.open(fbuf).convert("RGB")
     if mode.startswith("Fast"):
         max_dim = 1000
@@ -131,12 +132,18 @@ def process_page(fname, fbuf, reader, mode):
             mapped.append((closest_bubble, text))
 
     page_log = []
-    with ThreadPoolExecutor(max_workers=8) as executor:
-        futures = {executor.submit(translate_text_with_log, t, page_log): (bubble, t) for bubble, t in mapped}
-        for future in as_completed(futures):
-            bubble, _ = futures[future]
-            translated = future.result()
-            draw_text_in_bubble(draw, translated, bubble)
+    for bubble, text in mapped:
+        translated = translate_text_with_log(text, page_log)
+        draw_text_in_bubble(draw, translated, bubble)
+
+    # Save processed page to backup folder
+    output_path = os.path.join(BACKUP_DIR, fname)
+    image.save(output_path, "PNG")
+
+    # Save translation log incrementally
+    log_path = os.path.join(BACKUP_DIR, "translation_log.json")
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(page_log, ensure_ascii=False) + "\n")
 
     return fname, image, page_log
 
@@ -152,12 +159,21 @@ uploaded_files = st.file_uploader(
 )
 
 mode = st.radio("OCR Mode:", ["Fast (smaller images, quicker)", "Accurate (larger images, slower)"])
-chunk_size = st.number_input("Chunk size (pages per batch)", min_value=1, max_value=20, value=5)
 
 if 'processed_pages_dict' not in st.session_state:
     st.session_state['processed_pages_dict'] = {}
 if 'translation_log' not in st.session_state:
     st.session_state['translation_log'] = []
+
+# Load unfinished backup
+if os.path.exists(BACKUP_DIR):
+    for f in sorted(os.listdir(BACKUP_DIR)):
+        if f.endswith(".png") and f not in st.session_state['processed_pages_dict']:
+            st.session_state['processed_pages_dict'][f] = Image.open(os.path.join(BACKUP_DIR, f))
+    log_file = os.path.join(BACKUP_DIR, "translation_log.json")
+    if os.path.exists(log_file):
+        with open(log_file, encoding="utf-8") as f:
+            st.session_state['translation_log'] = [json.loads(line) for line in f]
 
 if uploaded_files:
     reader = easyocr.Reader(['ch_sim','en'], gpu=True)
@@ -166,7 +182,7 @@ if uploaded_files:
     for file in uploaded_files:
         if file.name.lower().endswith(".pdf"):
             dpi = 100 if mode.startswith("Fast") else 200
-            pdf_pages = convert_from_bytes(file.read(), dpi=dpi)
+            pdf_pages = convert_from_bytes(file.read(), dpi=dpi, poppler_path="/usr/bin")
             for i, page in enumerate(pdf_pages, start=1):
                 fname = f"{file.name}_page{str(i).zfill(4)}.png"
                 buf = io.BytesIO()
@@ -192,21 +208,21 @@ if uploaded_files:
             progress.progress(idx / total_files)
             status_text.text(f"Processed page {idx}/{total_files}")
 
-    # Merge into PDF
-    all_pages_sorted = [st.session_state['processed_pages_dict'][fname] for fname in sorted(st.session_state['processed_pages_dict'].keys())]
-    if all_pages_sorted:
-        pdf_buf = io.BytesIO()
-        all_pages_sorted[0].save(pdf_buf, format="PDF", save_all=True, append_images=all_pages_sorted[1:])
-        pdf_buf.seek(0)
-        st.success("✅ All pages merged into PDF!")
+# Merge into PDF
+all_pages_sorted = [st.session_state['processed_pages_dict'][fname] for fname in sorted(st.session_state['processed_pages_dict'].keys())]
+if all_pages_sorted:
+    pdf_buf = io.BytesIO()
+    all_pages_sorted[0].save(pdf_buf, format="PDF", save_all=True, append_images=all_pages_sorted[1:])
+    pdf_buf.seek(0)
+    st.success("✅ All pages merged into PDF!")
+    st.download_button(
+        label="📕 Download Full Chapter PDF",
+        data=pdf_buf,
+        file_name="chapter_translated.pdf",
+        mime="application/pdf"
+    )
 
-        st.download_button(
-            label="📕 Download Full Chapter PDF",
-            data=pdf_buf,
-            file_name="chapter_translated.pdf",
-            mime="application/pdf"
-        )
-
+# Translation log
 with st.expander("📝 Translation Log (Original → Clean → Translated)"):
     for entry in st.session_state['translation_log']:
         st.markdown(f"**Original:** {entry['original']}")
