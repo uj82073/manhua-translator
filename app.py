@@ -4,13 +4,15 @@ import numpy as np
 import cv2
 from deep_translator import GoogleTranslator
 import easyocr
-import io, os, textwrap, re, concurrent.futures
+import io, os, textwrap, re, concurrent.futures, sys
 from pdf2image import convert_from_bytes
 
 # ==============================
 # Paths & Config
 # ==============================
-FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+DEFAULT_FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+FONT_PATH = DEFAULT_FONT if os.path.exists(DEFAULT_FONT) else None
+
 TEMP_DIR = "temp_pages"
 BACKUP_DIR = "processed"
 os.makedirs(TEMP_DIR, exist_ok=True)
@@ -39,21 +41,18 @@ def polish_translation(text: str) -> str:
     text = re.sub(r"\s+([?.!,])", r"\1", text)
     return text
 
-def translate_text_with_log(text, page_log):
-    try:
-        clean = clean_text_for_translation(text)
-        if not clean:
-            translated = ""
-        elif re.match(r"^[A-Za-z0-9 .,!?'-]+$", clean):
-            translated = polish_translation(clean)
-        else:
+def translate_text(text):
+    clean = clean_text_for_translation(text)
+    if not clean:
+        return "", clean
+    elif re.match(r"^[A-Za-z0-9 .,!?'-]+$", clean):
+        return polish_translation(clean), clean
+    else:
+        try:
             translated = GoogleTranslator(source='zh-CN', target='en').translate(clean)
-            translated = polish_translation(translated)
-        page_log.append({"original": text, "cleaned": clean, "translated": translated})
-        return translated
-    except Exception:
-        page_log.append({"original": text, "cleaned": text, "translated": "[Error]"})
-        return "[Error]"
+            return polish_translation(translated), clean
+        except Exception:
+            return "[Error]", clean
 
 # ==============================
 # Bubble Detection
@@ -75,7 +74,9 @@ def detect_bubbles(image_pil):
 # ==============================
 def fit_text_in_box(draw, text, box, max_font=28, min_font=12, padding=5):
     x, y, w, h = box
-    text = str(text)
+    if not FONT_PATH:
+        font = ImageFont.load_default()
+        return font, [text], font.getbbox("A")[3], 
     for font_size in range(max_font, min_font-1, -1):
         font = ImageFont.truetype(FONT_PATH, font_size)
         avg_char_width = sum(font.getbbox(c)[2]-font.getbbox(c)[0] for c in text)/max(len(text), 1)
@@ -135,18 +136,20 @@ def process_page(fname, fbuf, reader, mode):
             mapped.append((closest_bubble, text))
 
     page_log = []
+    translations = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-        futures = {executor.submit(translate_text_with_log, t, page_log): (bubble, t) for bubble, t in mapped}
+        futures = {executor.submit(translate_text, t): (bubble, t) for bubble, t in mapped}
         for future in concurrent.futures.as_completed(futures):
-            bubble, _ = futures[future]
-            translated = future.result()
+            bubble, original = futures[future]
+            translated, cleaned = future.result()
+            translations.append({"original": original, "cleaned": cleaned, "translated": translated})
             draw_text_in_bubble(draw, translated, bubble)
 
     # Save backup image
     backup_path = os.path.join(BACKUP_DIR, fname.replace("/", "_") + ".png")
     image.save(backup_path)
 
-    return fname, image, page_log
+    return fname, image, translations
 
 # ==============================
 # Streamlit UI
@@ -167,7 +170,11 @@ if 'translation_log' not in st.session_state:
     st.session_state['translation_log'] = []
 
 if uploaded_files:
-    reader = easyocr.Reader(['ch_sim','en'], gpu=True)
+    try:
+        reader = easyocr.Reader(['ch_sim','en'], gpu=(os.environ.get("USE_GPU","0")=="1"))
+    except Exception:
+        reader = easyocr.Reader(['ch_sim','en'], gpu=False)
+
     all_files = []
 
     for file in uploaded_files:
@@ -183,6 +190,7 @@ if uploaded_files:
         else:
             all_files.append((file.name, file))
 
+    # filter already processed
     all_files = [(fname, fbuf) for fname, fbuf in all_files if fname not in st.session_state['processed_pages_dict']]
     total_files = len(all_files)
 
