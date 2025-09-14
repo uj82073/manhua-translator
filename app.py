@@ -115,7 +115,7 @@ def draw_text_in_bubble(draw, text, bubble, padding=5):
         draw.text((text_x, text_y), line, font=font, fill="black")
 
 # ==============================
-# Process one page (safe mode)
+# Process one page
 # ==============================
 def process_page(fname, fbuf, reader, mode):
     try:
@@ -176,7 +176,7 @@ if 'translation_log' not in st.session_state:
 
 if uploaded_files:
     try:
-        reader = easyocr.Reader(['ch_sim','en'], gpu=False)  # force CPU to reduce GPU crash risk
+        reader = easyocr.Reader(['ch_sim','en'], gpu=False)
         all_files = []
         for file in uploaded_files:
             if file.name.lower().endswith(".pdf"):
@@ -213,14 +213,18 @@ if uploaded_files:
                     progress.progress(idx / total_files)
                     status_text.text(f"Processed page {idx}/{total_files}")
 
-        # Merge into PDF
+        # Merge into PDF and clear images after download
         all_pages_sorted = [st.session_state['processed_pages_dict'][fname] for fname in sorted(st.session_state['processed_pages_dict'].keys())]
         if all_pages_sorted:
             pdf_buf = io.BytesIO()
             all_pages_sorted[0].save(pdf_buf, format="PDF", save_all=True, append_images=all_pages_sorted[1:])
             pdf_buf.seek(0)
-            st.success("✅ All pages merged into PDF!")
-            st.download_button("📕 Download Full Chapter PDF", data=pdf_buf, file_name="chapter_translated.pdf", mime="application/pdf")
+
+            if st.download_button("📕 Download Full Chapter PDF", data=pdf_buf, file_name="chapter_translated.pdf", mime="application/pdf"):
+                # Clear memory after download
+                st.session_state['processed_pages_dict'].clear()
+                st.session_state['translation_log'].clear()
+                st.success("🧹 Cleared all processed images and logs from memory!")
 
     except Exception as e:
         st.error(f"🔥 Top-level error: {e}")
@@ -228,7 +232,7 @@ if uploaded_files:
 
 # Translation log
 with st.expander("📝 Translation Log (Original → Clean → Translated)"):
-    for entry in st.session_state['translation_log']:
+    for entry in st.session_state.get('translation_log', []):
         st.markdown(f"**Original:** {entry['original']}")
         st.markdown(f"**Cleaned:** {entry['cleaned']}")
         st.markdown(f"**Translated:** {entry['translated']}")
